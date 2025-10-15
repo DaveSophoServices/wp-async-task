@@ -5,9 +5,19 @@
  * Description: Creates an abstract class to execute asynchronous tasks
  * Author: 10up, Eric Mann, Luke Gedeon, John P. Bloch
  * License: MIT
+ *
+ * @codingStandardsIgnoreFile
  */
 
+// Exit if accessed directly.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
 if ( ! class_exists( 'WP_Async_Task' ) ) {
+	/**
+	 * WP Async Task abstract class.
+	 */
 	abstract class WP_Async_Task {
 
 		/**
@@ -55,7 +65,7 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		/**
 		 * @var array
 		 */
-		protected $_body_data;
+		protected $_body_data = array();
 
 		/**
 		 * Constructor to wire up the necessary actions
@@ -75,12 +85,20 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		 */
 		public function __construct( $auth_level = self::BOTH ) {
 			if ( empty( $this->action ) ) {
-				throw new Exception( 'Action not defined for class ' . __CLASS__ );
+				throw new Exception( 'Action not defined for class ' . get_class( $this ) );
 			}
-			add_action( $this->action, array( $this, 'launch' ), (int) $this->priority, (int) $this->argument_count );
+			
+			add_action( 
+				$this->action, 
+				array( $this, 'launch' ), 
+				(int) $this->priority, 
+				(int) $this->argument_count 
+			);
+			
 			if ( $auth_level & self::LOGGED_IN ) {
 				add_action( "admin_post_wp_async_$this->action", array( $this, 'handle_postback' ) );
 			}
+			
 			if ( $auth_level & self::LOGGED_OUT ) {
 				add_action( "admin_post_nopriv_wp_async_$this->action", array( $this, 'handle_postback' ) );
 			}
@@ -94,10 +112,20 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		 */
 		public function launch() {
 			$data = func_get_args();
+			
 			try {
 				$data = $this->prepare_data( $data );
 			} catch ( Exception $e ) {
+				// Log the exception if debugging is enabled.
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+					error_log( 'WP_Async_Task preparation failed: ' . $e->getMessage() );
+				}
 				return;
+			}
+
+			// Ensure data is an array.
+			if ( ! is_array( $data ) ) {
+				$data = array();
 			}
 
 			$data['action'] = "wp_async_$this->action";
@@ -126,10 +154,15 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		 * @uses wp_remote_post()
 		 */
 		public function launch_on_shutdown() {
-			if ( ! empty( $this->_body_data ) ) {
+			if ( ! empty( $this->_body_data ) && is_array( $this->_body_data ) ) {
 				$cookies = array();
-				foreach ( $_COOKIE as $name => $value ) {
-					$cookies[] = "$name=" . urlencode( is_array( $value ) ? serialize( $value ) : $value );
+				
+				// Safely process cookies.
+				if ( ! empty( $_COOKIE ) && is_array( $_COOKIE ) ) {
+					foreach ( $_COOKIE as $name => $value ) {
+						$cookie_value = is_array( $value ) ? serialize( $value ) : $value;
+						$cookies[] = "$name=" . urlencode( $cookie_value );
+					}
 				}
 
 				$request_args = array(
@@ -140,31 +173,51 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 					'headers'   => array(
 						'cookie' => implode( '; ', $cookies ),
 					),
+					'compress'  => true,
 				);
 
 				$url = admin_url( 'admin-post.php' );
 
-				wp_remote_post( $url, $request_args );
+				// Add a filter to allow modification of request args.
+				$request_args = apply_filters( 'wp_async_task_request_args', $request_args, $this->action );
+
+				$response = wp_remote_post( $url, $request_args );
+				
+				// Log errors if debugging is enabled.
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG && is_wp_error( $response ) ) {
+					error_log( 'WP_Async_Task request failed: ' . $response->get_error_message() );
+				}
 			}
 		}
 
 		/**
 		 * Verify the postback is valid, then fire any scheduled events.
 		 *
-		 * @uses $_POST['_nonce']
 		 * @uses is_user_logged_in()
 		 * @uses add_filter()
 		 * @uses wp_die()
 		 */
 		public function handle_postback() {
-			if ( isset( $_POST['_nonce'] ) && $this->verify_async_nonce( $_POST['_nonce'] ) ) {
+			// Use ap_sanitize_unslash if available, otherwise use sanitize_text_field.
+			if ( function_exists( 'ap_sanitize_unslash' ) ) {
+				$nonce = ap_sanitize_unslash( '_nonce', 'r' );
+			} else {
+				$nonce = isset( $_REQUEST['_nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['_nonce'] ) ) : '';
+			}
+
+			if ( ! empty( $nonce ) && false !== $this->verify_async_nonce( $nonce ) ) {
 				if ( ! is_user_logged_in() ) {
 					$this->action = "nopriv_$this->action";
 				}
 				$this->run_action();
 			}
 
-			add_filter( 'wp_die_handler', function() { die(); } );
+			add_filter(
+				'wp_die_handler',
+				function() {
+					die();
+				}
+			);
 			wp_die();
 		}
 
@@ -197,20 +250,26 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		 * @return bool Whether the nonce check passed or failed
 		 */
 		protected function verify_async_nonce( $nonce ) {
+			if ( ! is_string( $nonce ) || empty( $nonce ) ) {
+				return false;
+			}
+
 			$action = $this->get_nonce_action();
 			$i      = wp_nonce_tick();
 
-			// Nonce generated 0-12 hours ago
-			if ( substr( wp_hash( $i . $action . get_class( $this ), 'nonce' ), - 12, 10 ) == $nonce ) {
+			// Nonce generated 0-12 hours ago.
+			$expected_nonce_1 = substr( wp_hash( $i . $action . get_class( $this ), 'nonce' ), - 12, 10 );
+			if ( hash_equals( $expected_nonce_1, $nonce ) ) {
 				return 1;
 			}
 
-			// Nonce generated 12-24 hours ago
-			if ( substr( wp_hash( ( $i - 1 ) . $action . get_class( $this ), 'nonce' ), - 12, 10 ) == $nonce ) {
+			// Nonce generated 12-24 hours ago.
+			$expected_nonce_2 = substr( wp_hash( ( $i - 1 ) . $action . get_class( $this ), 'nonce' ), - 12, 10 );
+			if ( hash_equals( $expected_nonce_2, $nonce ) ) {
 				return 2;
 			}
 
-			// Invalid nonce
+			// Invalid nonce.
 			return false;
 		}
 
@@ -221,9 +280,11 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		 */
 		protected function get_nonce_action() {
 			$action = $this->action;
-			if ( substr( $action, 0, 7 ) === 'nopriv_' ) {
+			
+			if ( is_string( $action ) && substr( $action, 0, 7 ) === 'nopriv_' ) {
 				$action = substr( $action, 7 );
 			}
+			
 			$action = "wp_async_$action";
 			return $action;
 		}
@@ -261,6 +322,4 @@ if ( ! class_exists( 'WP_Async_Task' ) ) {
 		abstract protected function run_action();
 
 	}
-
 }
-
